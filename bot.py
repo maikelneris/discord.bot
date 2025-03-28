@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from langdetect import detect, DetectorFactory
-from search_providers import GoogleSearchProvider, BloomzSearchProvider
+from search_providers import SearchProviderFactory
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -34,9 +34,10 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Initialize search providers
+# Initialize search provider factory
 search_mode = os.getenv('SEARCH_MODE', 'google')
-search_provider = BloomzSearchProvider() if search_mode == 'ai' else GoogleSearchProvider()
+search_factory = SearchProviderFactory()
+logger.info(f"Bot initialized with search mode: {search_mode}")
 
 # Initialize text-to-speech engine
 engine = pyttsx3.init()
@@ -88,9 +89,16 @@ async def leave(ctx):
 
 @bot.command(name='listen')
 async def listen(ctx):
-    if not ctx.voice_client:
+    # Check if user is in a voice channel
+    if not ctx.author.voice:
         await ctx.send("You need to be in a voice channel first!")
         return
+
+    # If bot is not in a voice channel, join the user's channel
+    if not ctx.voice_client:
+        channel = ctx.author.voice.channel
+        await channel.connect()
+        await ctx.send(f"Joined {channel.name}")
 
     await ctx.send("Listening... (10 seconds)")
     
@@ -99,59 +107,107 @@ async def listen(ctx):
         temp_filename = temp_file.name
 
     try:
-        # Record audio
-        source = ctx.voice_client.source
-        audio_data = await source.read()
-        
-        # Save audio to temporary file
-        with open(temp_filename, 'wb') as f:
-            f.write(audio_data)
-
-        # Recognize speech
-        with sr.AudioFile(temp_filename) as source:
-            audio = recognizer.record(source)
+        # Use microphone for recording
+        with sr.Microphone() as source:
+            await ctx.send("Speak now...")
             try:
-                text = recognizer.recognize_google(audio, language='pt-BR')
-                await ctx.send(f"You said: {text}")
+                # Adjust for ambient noise
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 
-                # Process the command
-                text_response, voice_response = await process_command(text)
+                # Record audio
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
                 
-                # Send text response
-                await ctx.send(text_response)
-                
-                # Convert response to speech
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    response_filename = temp_file.name
-                
-                engine.save_to_file(voice_response, response_filename)
-                engine.runAndWait()
-                
-                # Play the response
-                ctx.voice_client.play(discord.FFmpegPCMAudio(response_filename))
-                
-            except sr.UnknownValueError:
-                await ctx.send("Sorry, I couldn't understand that.")
-            except sr.RequestError as e:
-                await ctx.send(f"Sorry, there was an error with the speech recognition service: {e}")
+                # Save audio to temporary file
+                with open(temp_filename, 'wb') as f:
+                    f.write(audio.get_wav_data())
+
+                # Recognize speech
+                with sr.AudioFile(temp_filename) as source:
+                    audio = recognizer.record(source)
+                    try:
+                        text = recognizer.recognize_google(audio, language='pt-BR')
+                        await ctx.send(f"You said: {text}")
+                        
+                        # Process the command
+                        text_response, voice_response = await process_command(text)
+                        
+                        # Send text response
+                        await ctx.send(text_response)
+                        
+                        # Convert response to speech
+                        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                            response_filename = temp_file.name
+                        
+                        # Generate speech using pyttsx3
+                        engine.save_to_file(voice_response, response_filename)
+                        engine.runAndWait()
+                        
+                        # Stop any currently playing audio
+                        if ctx.voice_client.is_playing():
+                            ctx.voice_client.stop()
+                        
+                        # Play the response
+                        audio_source = discord.FFmpegPCMAudio(response_filename)
+                        ctx.voice_client.play(audio_source)
+                        
+                        # Wait for the audio to finish playing
+                        while ctx.voice_client.is_playing():
+                            await asyncio.sleep(0.1)
+                        
+                        # Add a small delay to ensure FFmpeg has finished
+                        await asyncio.sleep(0.5)
+                        
+                        # Leave the voice channel after responding
+                        await ctx.voice_client.disconnect()
+                        await ctx.send("Left the voice channel")
+                        
+                    except sr.UnknownValueError:
+                        await ctx.send("Sorry, I couldn't understand that.")
+                        # Leave the voice channel even if speech wasn't understood
+                        await ctx.voice_client.disconnect()
+                        await ctx.send("Left the voice channel")
+                    except sr.RequestError as e:
+                        await ctx.send(f"Sorry, there was an error with the speech recognition service: {e}")
+                        # Leave the voice channel on error
+                        await ctx.voice_client.disconnect()
+                        await ctx.send("Left the voice channel")
+                    except Exception as e:
+                        await ctx.send(f"An error occurred: {e}")
+                        # Leave the voice channel on error
+                        await ctx.voice_client.disconnect()
+                        await ctx.send("Left the voice channel")
+                        
+            except sr.WaitTimeoutError:
+                await ctx.send("No speech detected within timeout period.")
+                # Leave the voice channel on timeout
+                await ctx.voice_client.disconnect()
+                await ctx.send("Left the voice channel")
             except Exception as e:
-                await ctx.send(f"An error occurred: {e}")
+                await ctx.send(f"An error occurred while recording: {e}")
+                # Leave the voice channel on error
+                await ctx.voice_client.disconnect()
+                await ctx.send("Left the voice channel")
     
     finally:
         # Clean up temporary files
         try:
-            os.unlink(temp_filename)
-            os.unlink(response_filename)
-        except:
-            pass
+            if os.path.exists(temp_filename):
+                os.unlink(temp_filename)
+            if os.path.exists(response_filename):
+                os.unlink(response_filename)
+        except Exception as e:
+            logger.error(f"Error cleaning up temporary files: {e}")
 
 async def process_command(text: str) -> tuple[str, str]:
     try:
+        # Get the appropriate provider
+        provider = search_factory.get_provider(search_mode)
+        
         # Get search results
-        results = search_provider.search(text)
+        results = provider.search(text)
         
         # Format response
-        text_response, voice_response = search_provider.format_response(results)
+        text_response, voice_response = provider.format_response(results)
         
         return text_response, voice_response
         

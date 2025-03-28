@@ -130,4 +130,21 @@ class BloomzSearchProvider(SearchProvider):
         # Get first sentence for voice response
         voice_response = response.split('.')[0] + '.' if '.' in response else response[:15] + '...'
 
-        return response, voice_response 
+        return response, voice_response
+
+class SearchProviderFactory:
+    def __init__(self):
+        self.google_provider = GoogleSearchProvider()
+        self.ai_provider = None  # Lazy initialization
+        logging.info("SearchProviderFactory initialized with Google provider")
+
+    def get_provider(self, mode: str) -> SearchProvider:
+        if mode == 'google':
+            return self.google_provider
+        elif mode == 'ai':
+            if self.ai_provider is None:
+                logging.info("Initializing AI provider (BLOOMZ)")
+                self.ai_provider = BloomzSearchProvider()
+            return self.ai_provider
+        else:
+            raise ValueError(f"Invalid search mode: {mode}") 
